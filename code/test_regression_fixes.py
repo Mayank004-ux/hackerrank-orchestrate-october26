@@ -647,18 +647,17 @@ class TestRegressionFixes(unittest.TestCase):
                 self.assertEqual(s["evidence_id"], "")
 
     def test_case_04_evidence_limitation_and_incomplete_classification(self):
-        """11. case_04 evaluates as INCOMPLETE due to lack of participant-visible evidence for account_004."""
+        """11. case_04 evaluates as INCOMPLETE due to lack of participant-visible evidence for account_004.
+        Compliant records (analytics_901 in evidence_56) must not be misrepresented as future actions with empty evidence_id.
+        """
         sample_reqs_path = os.path.join(self.dataset_dir, "sample_deletion_requests.csv")
         with open(sample_reqs_path, "r", encoding="utf-8") as f:
             c4_req = next(r for r in csv.DictReader(f) if r["case_id"] == "case_04")
         cid, status, steps = self.pipeline.evaluate_case(c4_req)
         self.assertEqual(cid, "case_04")
         self.assertEqual(status, "INCOMPLETE")
-        ana_steps = [s for s in steps if s["system_id"] == "analytics_platform"]
-        self.assertEqual(len(ana_steps), 1)
-        self.assertEqual(ana_steps[0]["operation"], "VERIFY_RECORD_ANONYMIZED")
-        self.assertEqual(ana_steps[0]["resource_id"], "analytics_901")
-        self.assertEqual(ana_steps[0]["evidence_id"], "")
+        # In an INCOMPLETE case, compliant unviolated resources must not be emitted as future post-remediation checks
+        self.assertEqual(steps, [])
 
     def test_duplicate_observations_do_not_produce_duplicate_audit_steps(self):
         """12. Duplicate observations of the same resource do not produce duplicate audit steps."""
@@ -1284,6 +1283,119 @@ class TestRegressionFixes(unittest.TestCase):
         cid, status, steps = self.pipeline.evaluate_case(synthetic_req)
         self.assertEqual(status, "INCOMPLETE")
         self.assertEqual(steps, [])
+
+    def test_A_unrelated_activity_near_request(self):
+        """Test A: Unrelated activity near request is not assigned based solely on timing."""
+        linker = ResourceLinker(self.dataset_dir)
+        ident = UserIdentity(
+            user_id="user_test_a",
+            primary_name="Test User A",
+            primary_email="user_a@example.com",
+            primary_phone="+15550000001",
+            primary_email_hash="hash_a",
+            updated_at="2026-08-01T00:00:00Z",
+            all_emails={"user_a@example.com"},
+        )
+        linker.populate_user_resources(ident, audit_at="2026-09-01T12:00:00Z")
+        self.assertNotIn("analytics_unrelated_9999", ident.known_resource_ids)
+        self.assertIsNone(linker.get_resource_owner("analytics_platform", "analytics_unrelated_9999", "2026-09-01T12:00:00Z"))
+
+    def test_B_explicit_ownership(self):
+        """Test B: Activity or evidence containing explicit subject identity establishes ownership."""
+        linker = ResourceLinker(self.dataset_dir)
+        # support_4707 in evidence_92 explicitly has customer_reference='user_27'
+        owner = linker.get_resource_owner("support_platform", "support_4707", "2026-09-20T00:00:00Z")
+        self.assertEqual(owner, "user_27")
+        # Also verify manual explicit grounding via _add_grounded_res
+        linker._add_grounded_res("user_generic_b", "support_platform", "support_generic_b", "ev_generic", "2026-08-15T10:00:00Z")
+        self.assertEqual(linker.get_resource_owner("support_platform", "support_generic_b", "2026-08-20T00:00:00Z"), "user_generic_b")
+
+    def test_C_batch_requests_order_independent(self):
+        """Test C: Batch requests sharing reported timestamp do not assign ownership by list order."""
+        linker = ResourceLinker(self.dataset_dir)
+        # Ground two accounts with explicit owners
+        linker._add_grounded_res("user_batch_1", "account_service", "account_batch_1", "ev_batch", "2026-08-01T00:00:00Z")
+        linker._add_grounded_res("user_batch_2", "account_service", "account_batch_2", "ev_batch", "2026-08-01T00:00:00Z")
+        # Verify ownership is resolved by grounded link, not list position
+        self.assertEqual(linker.get_resource_owner("account_service", "account_batch_1", "2026-08-10T00:00:00Z"), "user_batch_1")
+        self.assertEqual(linker.get_resource_owner("account_service", "account_batch_2", "2026-08-10T00:00:00Z"), "user_batch_2")
+        self.assertNotEqual(linker.get_resource_owner("account_service", "account_batch_1", "2026-08-10T00:00:00Z"), "user_batch_2")
+
+    def test_D_non_account_resource_grounded_in_batch(self):
+        """Test D: Non-account resources explicitly connected via valid evidence are retained in batch."""
+        ident_27 = self.resolver.resolve("ananya-nair@gmail.com")
+        self.assertIsNotNone(ident_27)
+        self.assertEqual(ident_27.user_id, "user_27")
+        self.pipeline.linker.populate_user_resources(ident_27, audit_at="2026-09-20T00:00:00Z")
+        # Grounded support resource support_4707 must be retained
+        self.assertIn("support_4707", ident_27.known_resource_ids)
+
+    def test_E_conflicting_subject_references(self):
+        """Test E: Evidence-grounded ownership overrides weaker temporal association."""
+        linker = ResourceLinker(self.dataset_dir)
+        # search_6302 occurred near case_04 (user_04), but evidence_08 explicitly identifies user_83
+        owner = linker.get_resource_owner("search_service", "search_6302", "2026-09-10T00:00:00Z")
+        self.assertEqual(owner, "user_83")
+        self.assertNotEqual(owner, "user_04")
+
+        # Verify pipeline does not attribute search_6302 to user_04
+        ident_04 = self.resolver.resolve("thandiwe.n@gmail.com")
+        self.assertIsNotNone(ident_04)
+        self.pipeline.linker.populate_user_resources(ident_04, audit_at="2026-09-07T10:20:00Z")
+        self.assertNotIn("search_6302", ident_04.known_resource_ids)
+
+    def test_F_historical_cutoff(self):
+        """Test F: Ownership link or evidence captured after audit_at does not establish historical ownership."""
+        linker = ResourceLinker(self.dataset_dir)
+        # Ground resource at future timestamp
+        future_time = "2026-09-25T12:00:00Z"
+        linker._add_grounded_res("user_cutoff_test", "support_platform", "support_cutoff_res", "ev_cutoff", future_time)
+        # Querying with a cutoff BEFORE capture time must return None
+        owner_before = linker.get_resource_owner("support_platform", "support_cutoff_res", "2026-09-20T00:00:00Z")
+        self.assertIsNone(owner_before, "Resource owner grounded in future evidence must not be visible before capture time")
+        # Querying with cutoff AFTER capture time returns owner
+        owner_after = linker.get_resource_owner("support_platform", "support_cutoff_res", "2026-09-30T00:00:00Z")
+        self.assertEqual(owner_after, "user_cutoff_test")
+
+    def test_G_unknown_ownership_fails_conservatively(self):
+        """Test G: When ownership cannot be established, pipeline fails conservatively without invented resources."""
+        synthetic_req = {
+            "case_id": "test_unknown_owner",
+            "email": "thandiwe.n@gmail.com",
+            "requested_at": "2026-08-25T12:32:00Z",
+            "reported_status": "COMPLETE",
+            "reported_at": "2026-08-27T08:54:00Z",
+            "audit_at": "2026-09-07T10:20:00Z",
+            "request_text": "I'm deleting my account. You can keep anonymous statistics, but nothing in analytics should still point back to me.",
+        }
+        cid, status, steps = self.pipeline.evaluate_case(synthetic_req)
+        # Must fail conservatively as INCOMPLETE
+        self.assertEqual(status, "INCOMPLETE")
+        # Must not invent ungrounded account or declare complete
+    def test_H_cross_system_fallback_avoidance(self):
+        """Test H: When system_id is provided, get_resource_owner does not resolve ownership across systems."""
+        linker = ResourceLinker(self.dataset_dir)
+        shared_rid = "resource_collision_999"
+        # Register shared_rid under system_a for user_sys_a
+        linker._add_grounded_res("user_sys_a", "system_a", shared_rid, "ev_sys_a", "2026-08-01T00:00:00Z")
+        # Query under system_b where shared_rid does not exist
+        owner_b = linker.get_resource_owner("system_b", shared_rid, "2026-08-15T00:00:00Z")
+        self.assertIsNone(owner_b, "Resource owner in system_a must not be resolved under system_b")
+        # Direct lookup under system_a resolves correctly
+        owner_a = linker.get_resource_owner("system_a", shared_rid, "2026-08-15T00:00:00Z")
+        self.assertEqual(owner_a, "user_sys_a")
+
+    def test_I_incomplete_case_does_not_convert_compliant_resources_to_future_verification(self):
+        """Test I: In an INCOMPLETE case, already-compliant resources are not emitted as future actions with empty evidence_id."""
+        sample_reqs_path = os.path.join(self.dataset_dir, "sample_deletion_requests.csv")
+        with open(sample_reqs_path, "r", encoding="utf-8") as f:
+            c4_req = next(r for r in csv.DictReader(f) if r["case_id"] == "case_04")
+        cid, status, steps = self.pipeline.evaluate_case(c4_req)
+        self.assertEqual(status, "INCOMPLETE")
+        # analytics_901 was observed as ANONYMIZED in evidence_56 (compliant).
+        # It must NOT appear in future post-remediation verification steps.
+        orphan_verifs = [s for s in steps if s.get("resource_id") == "analytics_901"]
+        self.assertEqual(orphan_verifs, [], "Already-compliant record must not be emitted as an unexecuted future verification check")
 
 
 if __name__ == "__main__":

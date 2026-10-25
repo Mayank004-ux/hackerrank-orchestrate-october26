@@ -120,7 +120,12 @@ class DeletionAuditPipeline:
                         continue
 
                     # Check match against user identity
-                    if identity.matches(ident_str) or res_id in identity.known_resource_ids:
+                    if ident_str:
+                        matches_user = identity.matches(ident_str)
+                    else:
+                        matches_user = (res_id in identity.known_resource_ids)
+
+                    if matches_user:
                         s_upper = state_str.upper()
                         if s_upper in ("NOT_FOUND", "ABSENT", "404"):
                             obs_state = "ABSENT"
@@ -204,17 +209,20 @@ class DeletionAuditPipeline:
             sys_id = canonical_sys
 
             # Match user identity using word boundaries to prevent substring collisions (e.g. user_43 in user_437)
-            matches_user = False
-            if lookup_match and identity.matches(lookup_match.group(1)):
+            if lookup_match:
+                if not identity.matches(lookup_match.group(1)):
+                    continue
                 matches_user = True
-            elif re.search(r'\b' + re.escape(identity.user_id) + r'\b', full_trace_str, re.IGNORECASE):
-                matches_user = True
-            elif any(re.search(r'\b' + re.escape(e) + r'\b', full_trace_str, re.IGNORECASE) for e in identity.all_emails):
-                matches_user = True
-            elif any(re.search(r'\b' + re.escape(h) + r'\b', full_trace_str, re.IGNORECASE) for h in identity.all_hashes):
-                matches_user = True
-            elif res_id in identity.known_resource_ids:
-                matches_user = True
+            else:
+                matches_user = False
+                if re.search(r'\b' + re.escape(identity.user_id) + r'\b', full_trace_str, re.IGNORECASE):
+                    matches_user = True
+                elif any(re.search(r'\b' + re.escape(e) + r'\b', full_trace_str, re.IGNORECASE) for e in identity.all_emails):
+                    matches_user = True
+                elif any(re.search(r'\b' + re.escape(h) + r'\b', full_trace_str, re.IGNORECASE) for h in identity.all_hashes):
+                    matches_user = True
+                elif res_id in identity.known_resource_ids:
+                    matches_user = True
 
             if not matches_user:
                 continue
@@ -289,6 +297,27 @@ class DeletionAuditPipeline:
         # Process standalone lines (like syslog or search diagnostics)
         for line_str in non_trace_lines:
             line_lower = line_str.lower()
+
+            # Check if line explicitly identifies a DIFFERENT subject
+            explicit_sub_m = re.search(r'\b(?:subject_reference|customer_reference|user_id)=["\']?([^"\', ]+)["\']?', line_str)
+            if explicit_sub_m:
+                sub_val = explicit_sub_m.group(1).strip()
+                if sub_val.lower() not in ("none", "null", "anonymized", "redacted", ""):
+                    if sub_val.lower() != identity.user_id.lower() and not identity.matches(sub_val):
+                        continue
+
+            explicit_email_m = re.search(r'\b(?:customer_email|owner_email|requester_email)=["\']?([^"\', ]+)["\']?', line_str)
+            if explicit_email_m:
+                email_val = explicit_email_m.group(1).strip()
+                if email_val.lower() not in ("none", "null", "anonymized", "redacted", ""):
+                    if not identity.matches(email_val):
+                        continue
+
+            q_m = re.search(r'\bquery=["\']?([^"\', ]+)["\']?', line_str)
+            if q_m and "@" in q_m.group(1):
+                if not identity.matches(q_m.group(1).strip()):
+                    continue
+
             matches_user = (
                 any(re.search(r'\b' + re.escape(e) + r'\b', line_str, re.IGNORECASE) for e in identity.all_emails)
                 or bool(re.search(r'\b' + re.escape(identity.user_id) + r'\b', line_str, re.IGNORECASE))
@@ -453,6 +482,32 @@ class DeletionAuditPipeline:
 
     def _resource_matches_identity(self, obs: ObservedResource, identity: UserIdentity) -> bool:
         """Check if an observed resource belongs to the given subject identity."""
+        # 1. Reject if observation explicitly identifies a DIFFERENT subject
+        if obs.subject_user_id and obs.subject_user_id.strip().lower() not in ("none", "null", "anonymized", "redacted", ""):
+            if obs.subject_user_id.strip().lower() != identity.user_id.lower() and not identity.matches(obs.subject_user_id.strip()):
+                return False
+
+        if obs.subject_email and obs.subject_email.strip().lower() not in ("none", "null", "anonymized", "redacted", ""):
+            if not identity.matches(obs.subject_email.strip()):
+                return False
+
+        det = obs.details
+        if isinstance(det, dict):
+            for k in ("customer_reference", "subject_reference", "user_id"):
+                v = det.get(k)
+                if v and str(v).strip().lower() not in ("none", "null", "anonymized", "redacted", ""):
+                    v_str = str(v).strip()
+                    if v_str.lower() != identity.user_id.lower() and not identity.matches(v_str):
+                        return False
+
+            for k in ("email", "customer_email", "owner_email", "requester_email"):
+                v = det.get(k)
+                if v and str(v).strip().lower() not in ("none", "null", "anonymized", "redacted", ""):
+                    v_str = str(v).strip()
+                    if not identity.matches(v_str):
+                        return False
+
+        # 2. Accept positive matches
         if obs.subject_user_id and obs.subject_user_id.strip().lower() == identity.user_id.lower():
             return True
         if obs.subject_email and identity.matches(obs.subject_email):
@@ -460,8 +515,6 @@ class DeletionAuditPipeline:
         if obs.resource_id in identity.known_resource_ids:
             return True
 
-        # Check inside details
-        det = obs.details
         if isinstance(det, dict):
             # Check direct reference fields
             for k in ("customer_reference", "subject_reference", "user_id"):
@@ -597,6 +650,8 @@ class DeletionAuditPipeline:
         is_violation_found = False
         evaluation_failed = False
 
+        compliant_verif_steps: list[dict[str, Any]] = []
+
         for (sys_id, res_id), obs in sorted(selected_resources.items()):
             try:
                 res_eval = self.engine.evaluate_resource(obs, audit_at=audit_at)
@@ -629,7 +684,7 @@ class DeletionAuditPipeline:
                     raw_steps.append(res_eval["verification"])
             elif res_eval.get("is_compliant"):
                 if res_eval.get("verification"):
-                    raw_steps.append(res_eval["verification"])
+                    compliant_verif_steps.append(res_eval["verification"])
 
         # Determine deletion status
         # A case is COMPLETE only if:
@@ -675,6 +730,11 @@ class DeletionAuditPipeline:
 
         is_complete = (not is_violation_found) and (not evaluation_failed) and acc_has_evidence and retention_satisfied
         case_status = "COMPLETE" if is_complete else "INCOMPLETE"
+
+        # Compliant observations are verified proofs of completion for COMPLETE cases;
+        # in INCOMPLETE cases, unviolated resources must not be emitted as future post-remediation checks.
+        if is_complete:
+            raw_steps.extend(compliant_verif_steps)
 
         # 1. Primary account verification in account_service
         if not has_acc_step and acc_info and (acc_info[0].startswith("account_") or acc_info[0].startswith("tombstone_")):

@@ -89,14 +89,14 @@ The final file must contain 518 data rows sorted by `case_id` (plus the header r
 Your `code.zip` must include:
 
 ```text
-code/evaluation/evaluation_report.md
-code/evaluation/usage_report.md
+evaluation/evaluation_report.md
+evaluation/usage_report.md
 ```
 
 - `evaluation_report.md` must cover case, row, field, and sequence accuracy, at least three additional evaluation cases created by you, failures found, and improvements made.
 - `usage_report.md` must cover the final full-dataset run, including model providers and names, model calls, input and output tokens, total and average tokens per request, and estimated total and per-request cost. Include per-model and overall totals when using multiple models.
 
-**Important:** Place `evaluation_report.md` and `usage_report.md` inside `code/evaluation/` (matching `code/evaluation/main.py` in this starter layout), write your complete evaluation metrics, custom evaluation test cases, and token/cost breakdowns directly inside those Markdown files, and keep prompts in source code or Markdown files. Automated code evaluation ignores raw data files (`.csv`, `.tsv`, `.json`, `.jsonl`, `.sql`, `.log`), so content stored only in those formats will not be visible to the code judge or AI interviewer.
+**Important:** Place `evaluation_report.md` and `usage_report.md` inside `evaluation/` (matching the `AGENTS.md` challenge layout), write your complete evaluation metrics, custom evaluation test cases, and token/cost breakdowns directly inside those Markdown files, and keep prompts in source code or Markdown files. Automated code evaluation ignores raw data files (`.csv`, `.tsv`, `.json`, `.jsonl`, `.sql`, `.log`), so content stored only in those formats will not be visible to the code judge or AI interviewer.
 
 ---
 
@@ -131,18 +131,18 @@ To package `code.zip` from the repository root without bundling the dataset:
 **macOS / Linux:**
 
 ```bash
-zip -r code.zip README.md code -x "*/__pycache__/*" "*/.venv/*" "*/venv/*" "*/node_modules/*" "*/.git/*" "*/.DS_Store"
+zip -r code.zip README.md code evaluation -x "*/__pycache__/*" "*/.venv/*" "*/venv/*" "*/node_modules/*" "*/.git/*" "*/.DS_Store"
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
-Compress-Archive -Path README.md, code -DestinationPath code.zip -Force
+Compress-Archive -Path README.md, code, evaluation -DestinationPath code.zip -Force
 ```
 
 When packaging `code.zip`:
 
-- Keep your evaluation reports in `code/evaluation/` so they are bundled automatically with `code` (or add `evaluation` to the archive command above if you placed them in a top-level `evaluation/` directory).
+- Keep your evaluation reports in the top-level `evaluation/` directory so they are bundled with `README.md` and `code` using the packaging command above.
 - Do **not** include `dataset/`, virtual environments (`.venv`, `venv`, `node_modules`), or build caches (`__pycache__`). On Windows, keep `.venv` at the repository root (outside `code/`) and remove any `code/__pycache__` folders before running `Compress-Archive`.
 - Do **not** include nested archives (`.zip`, `.tar`, `.gz`, `.tgz`, `.7z`, `.rar`) inside `code.zip` — submissions containing nested archive files will be rejected.
 
@@ -152,6 +152,6 @@ Before submitting, confirm that:
 - every `steps_json` value is a valid JSON array with consecutive step numbers starting at `1`;
 - findings cite valid evidence IDs, and `COMPLETE` verification steps cite evidence proving the current state;
 - proposed remediation and future verification steps use an empty `evidence_id` (`""`);
-- `code.zip` includes your runnable code, `README.md`, `code/evaluation/evaluation_report.md`, and `code/evaluation/usage_report.md`;
+- `code.zip` includes your runnable code, `README.md`, `evaluation/evaluation_report.md`, and `evaluation/usage_report.md`;
 - `log.txt` follows the `AGENTS.md` turn format and is uploaded to the `chat_transcript` slot; and
 - no API keys, credentials, real personal data, or sensitive configuration values are included.

@@ -66,6 +66,7 @@ class ResourceLinker:
         self.raw_grounded_entries: list[tuple[str, str, str, str, str]] = [] # uid, sys_name, rid, evid, cap_at
         self.account_ids_by_user: dict[str, list[tuple[str, str]]] = {} # uid -> list of (cap_at, rid)
         self.known_resource_owners: dict[str, list[tuple[str, str]]] = {} # rid -> list of (cap_at, uid)
+        self.known_resource_owners_by_system: dict[tuple[str, str], list[tuple[str, str]]] = {} # (sys_name, rid) -> list of (cap_at, uid)
         self.snapshot_present_accounts: list[tuple[str, str, set[str]]] = [] # evid, cap_at, present_ids
         self.empty_account_snapshots: list[tuple[str, str]] = [] # evid, cap_at
         self.snapshot_404_accounts: list[tuple[str, str, str]] = [] # evid, cap_at, rid
@@ -147,15 +148,35 @@ class ResourceLinker:
                 req_aud = b_reqs[0].get("audit_at", "")
                 known_accs = {aid for cap, aid in self.account_ids_by_user.get(uid, []) if (not req_aud or is_timestamp_le(cap, req_aud))}
                 for a in b_acts:
-                    existing_owner = self.get_resource_owner(a["resource_id"], a["event_time"])
+                    existing_owner = self.get_resource_owner(a["target_system"], a["resource_id"], req_aud or a["event_time"])
+                    if not existing_owner:
+                        existing_owner = self.get_known_evidence_owner(a["target_system"], a["resource_id"])
+
                     if existing_owner and existing_owner != uid:
                         continue
-                    if a["target_system"] != "account_service" or (not known_accs or a["resource_id"] in known_accs):
+
+                    if a["target_system"] == "account_service":
+                        if not known_accs or a["resource_id"] in known_accs:
+                            act_to_user[a["activity_id"]] = uid
+                    elif a["target_system"] == "analytics_platform":
                         act_to_user[a["activity_id"]] = uid
+                    else:
+                        if existing_owner == uid:
+                            act_to_user[a["activity_id"]] = uid
             else:
-                available_accs = list(b_acc_acts)
+                for a in list(b_acts):
+                    owner = self.get_known_evidence_owner(a["target_system"], a["resource_id"])
+                    if owner:
+                        for rw in b_reqs:
+                            if rw["user_id"] == owner:
+                                act_to_user[a["activity_id"]] = owner
+                                break
+
+                available_accs = [a for a in b_acc_acts if a["activity_id"] not in act_to_user]
                 unassigned_reqs = []
                 for rw in b_reqs:
+                    if any(act_to_user.get(a["activity_id"]) == rw["user_id"] and a["target_system"] == "account_service" for a in b_acts):
+                        continue
                     uid = rw["user_id"]
                     req_aud = rw.get("audit_at", "")
                     known_accs = {aid for cap, aid in self.account_ids_by_user.get(uid, []) if (not req_aud or is_timestamp_le(cap, req_aud))}
@@ -175,12 +196,16 @@ class ResourceLinker:
                     sub_accs = [a for a in available_accs if (a["reported_result"] == "SUCCESS") == status_filter]
                     for rw, a in zip(sub_reqs, sub_accs):
                         uid = rw["user_id"]
-                        act_to_user[a["activity_id"]] = uid
-                        available_accs.remove(a)
-                        unassigned_reqs.remove(rw)
+                        act_owner = self.get_known_evidence_owner(a["target_system"], a["resource_id"])
+                        if not act_owner or act_owner == uid:
+                            act_to_user[a["activity_id"]] = uid
+                            available_accs.remove(a)
+                            unassigned_reqs.remove(rw)
 
-                for rw, a in zip(unassigned_reqs, available_accs):
-                    act_to_user[a["activity_id"]] = rw["user_id"]
+                for rw, a in list(zip(unassigned_reqs, available_accs)):
+                    act_owner = self.get_known_evidence_owner(a["target_system"], a["resource_id"])
+                    if not act_owner or act_owner == rw["user_id"]:
+                        act_to_user[a["activity_id"]] = rw["user_id"]
 
         for row in rows:
             act_id = row["activity_id"].strip()
@@ -233,12 +258,41 @@ class ResourceLinker:
             self.account_ids_by_user.setdefault(uid_clean, []).append((cap_clean, rid_clean))
         if evid:
             self.known_resource_owners.setdefault(rid_clean, []).append((cap_clean, uid_clean))
+            self.known_resource_owners_by_system.setdefault((sys_clean, rid_clean), []).append((cap_clean, uid_clean))
 
-    def get_resource_owner(self, resource_id: str, at_time: str) -> Optional[str]:
-        """Return the owner of a resource established by evidence at or before at_time."""
-        entries = self.known_resource_owners.get(resource_id.strip(), [])
-        valid = [uid for cap_at, uid in entries if is_timestamp_le(cap_at, at_time)]
-        return valid[-1] if valid else None
+    def get_resource_owner(
+        self,
+        system_or_resource: str,
+        resource_or_time: str,
+        at_time: Optional[str] = None,
+    ) -> Optional[str]:
+        """Return the owner of a resource established by evidence at or before at_time.
+
+        Supports both:
+        - get_resource_owner(system_id, resource_id, at_time)
+        - get_resource_owner(resource_id, at_time)
+        """
+        if at_time is None:
+            rid = system_or_resource.strip()
+            cutoff = resource_or_time.strip()
+            entries = self.known_resource_owners.get(rid, [])
+            valid = [uid for cap_at, uid in entries if is_timestamp_le(cap_at, cutoff)]
+            return valid[-1] if valid else None
+        else:
+            sys_id = system_or_resource.strip()
+            rid = resource_or_time.strip()
+            cutoff = at_time.strip()
+            # Strictly scoped by (system_id, resource_id) without ambiguous cross-system fallback
+            entries = self.known_resource_owners_by_system.get((sys_id, rid), [])
+            valid = [uid for cap_at, uid in entries if is_timestamp_le(cap_at, cutoff)]
+            return valid[-1] if valid else None
+
+    def get_known_evidence_owner(self, system_id: str, resource_id: str) -> Optional[str]:
+        """Return the owner of a resource established in evidence, strictly scoped by system."""
+        sys_clean = system_id.strip()
+        rid_clean = resource_id.strip()
+        entries = self.known_resource_owners_by_system.get((sys_clean, rid_clean), [])
+        return entries[-1][1] if entries else None
 
     def _index_all_evidence(self) -> None:
         """Dynamically index user-resource relationships grounded in supplied evidence artifacts."""
@@ -434,8 +488,9 @@ class ResourceLinker:
                         if not res_m:
                             continue
                         rid = res_m.group(1).strip()
+                        sys_m = sys_pat.search(line)
                         svc_m = svc_pat.search(line)
-                        raw_svc = (svc_m.group(1) if svc_m else infer_service_from_resource_id(rid)).strip()
+                        raw_svc = (sys_m.group(1) if sys_m else (svc_m.group(1) if svc_m else infer_service_from_resource_id(rid))).strip()
                         if raw_svc == "support_replica":
                             raw_svc = "support_platform"
                         elif raw_svc == "search_index_service":
