@@ -9,12 +9,21 @@ from __future__ import annotations
 import csv
 import json
 import os
+import re
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Optional
 
 from code.identity import UserIdentity
+
+
+def is_valid_iso_timestamp(ts: str) -> bool:
+    """Return True if ts matches ISO-8601 UTC format (e.g. 2026-08-25T12:32:00Z)."""
+    if not ts or not isinstance(ts, str):
+        return False
+    pattern = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
+    return bool(re.match(pattern, ts.strip()))
 
 
 def is_timestamp_le(t1: str, t2: str) -> bool:
@@ -135,6 +144,7 @@ class ObservedResource:
     details: dict[str, Any] = field(default_factory=dict)
     subject_user_id: Optional[str] = None
     subject_email: Optional[str] = None
+    observed_at: str = ""
 
 
 class JsonEvidenceReader:

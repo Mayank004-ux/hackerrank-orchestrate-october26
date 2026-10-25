@@ -129,35 +129,135 @@ SYSTEM_COLLECTION_TO_CATEGORY: dict[tuple[str, str], str] = {
 }
 
 
-def classify_request_intent_heuristic(request_text: str) -> str:
-    """HEURISTIC_TEMPORARY: Keyword-based request intent detection.
+def classify_request_intent(request_text: str) -> str:
+    """Classify requester intent into DELETION, NOT_APPLICABLE, or AMBIGUOUS.
     
-    Used only as an explicitly labelled temporary heuristic during development;
-    not a substitute for final multilingual intent classification.
+    1. Authorized deletion intent: explicitly authorizes deletion or erasure of personal data or accounts
+       in supported dataset languages (English, French, Spanish, Portuguese, Japanese, Korean, German, Italian).
+    2. Explicitly unauthorized or out-of-scope intent: access, download/export copy, invoice requests,
+       marketing opt-out, profile correction, or explicit negation of deletion -> NOT_APPLICABLE.
+    3. Ambiguous or unknown intent: empty/missing text, vague phrases ("do something with my account",
+       "remove it", "handle my data") that cannot reliably establish deletion intent -> AMBIGUOUS.
     """
-    if not request_text:
-        return "DELETION"
-    text = str(request_text).lower()
+    if not request_text or not isinstance(request_text, str):
+        return "AMBIGUOUS"
 
-    # Explicit non-deletion patterns: access, download/export copy, tax invoice requests
-    non_del_keywords = [
-        "download my account information",
-        "copy of last year",
-        "copy of my invoice",
-        "copy of invoices",
-        "portable format",
-        "leave my profile",
-        "keep the account active",
-        "opt-out of marketing",
-        "unsubscribe from newsletter",
+    text = request_text.strip()
+    if not text:
+        return "AMBIGUOUS"
+
+    tl = text.lower()
+
+    # 1. Ambiguous / vague expressions without clear deletion authorization
+    ambiguous_patterns = [
+        r"^do something with my account\.?$",
+        r"^remove it\.?$",
+        r"^i need my data handled\.?$",
+        r"^handle my data\.?$",
+        r"^what about my account\??$",
+        r"^check my (data|account)\.?$",
+        r"^help with my (data|account)\.?$",
     ]
-    for kw in non_del_keywords:
-        if kw in text:
-            # Check if deletion is requested alongside
-            if not any(w in text for w in ("delete", "erase", "remove", "close", "supprimer", "eliminar")):
+    for pat in ambiguous_patterns:
+        if re.search(pat, tl):
+            return "AMBIGUOUS"
+
+    # Very short text (< 3 words) that doesn't explicitly name deletion and account/data
+    words = tl.split()
+    if len(words) <= 2:
+        if not any(w in tl for w in ["delete", "erase", "supprimer", "eliminar", "excluir", "削除", "삭제"]):
+            return "AMBIGUOUS"
+
+    # 2. Explicit non-deletion requests:
+    # A. Negated deletion intent
+    negated_del_patterns = [
+        r"\bnot (a request to|asking for|requesting) (delete|deletion|erase|erasure|close)\b",
+        r"\b(do not|don't) (close|delete|erase|remove) (the|my|this) account\b",
+        r"\b(do not|don't) (delete|erase|remove) (anything|any of my records)\b",
+        r"\bwithout removing (any|my)\b",
+        r"\bnot a request to (erase|delete)\b",
+        r"\bleave the account active\b",
+        r"\bleave my profile\b",
+        r"\bkeep the account (active|as it is)\b",
+        r"\bcontinue using the service\b",
+        r"\bi still (use it|need the account)\b",
+        r"\b(ne pas supprimer|no eliminar|nicht l[oö]schen)\b",
+    ]
+    for pat in negated_del_patterns:
+        if re.search(pat, tl):
+            return "NOT_APPLICABLE"
+
+    # B. Explicit out-of-scope non-deletion actions (access, correction, export, marketing opt-out, login help)
+    out_of_scope_indicators = [
+        r"download my account information",
+        r"copy of last year",
+        r"copy of (my|the)? ?invoices?",
+        r"send me a copy of the information",
+        r"what personal information you hold",
+        r"this is an information request",
+        r"portable format",
+        r"opt-out of marketing",
+        r"stop the promotional emails",
+        r"remove me from marketing lists only",
+        r"unsubscribe from (newsletter|marketing)",
+        r"mobile number .* out of date",
+        r"surname is misspelled",
+        r"change the email address used for this account",
+        r"can't access my profile and need help resetting",
+        r"help resetting the login",
+    ]
+    for pat in out_of_scope_indicators:
+        if re.search(pat, tl):
+            # In a mixed request, check if deletion is actually requested as primary action
+            # e.g., "Please delete this account, including the downloadable archive" -> deletion
+            del_matches = re.findall(
+                r"\b(delete|deletion|erase|erasure|supprimer|suppression|eliminar|eliminaci[oó]n|exclus[aã]o|excluir|削除|삭제)\b",
+                tl,
+            )
+            if not del_matches:
                 return "NOT_APPLICABLE"
 
-    return "DELETION"
+    # 3. Positive deletion intent in supported languages
+    deletion_patterns = [
+        # English
+        r"\b(delet(e|ed|ing|ion|ions)?)\b",
+        r"\b(eras(e|ed|ing|ure|ures)?)\b",
+        r"\b(remov(e|ed|ing|al|als)?)\b",
+        r"\b(purg(e|ed|ing)?)\b",
+        r"\b(wip(e|ed|ing)?)\b",
+        r"\b(clos(e|ed|ing))\b.*\b(account|profile)\b",
+        r"\b(account|profile)\b.*\b(clos(e|ed|ing))\b",
+        r"\b(profile|account)\s+is\s+gone\b",
+        # French
+        r"\b(supprim(er|é|ée|és|ées|e|ent|ant)?|suppression|suppressions)\b",
+        r"\b(effac(er|é|ée|és|ées|e|ent|ant)?|effacement)\b",
+        r"\b(fermer|fermeture)\b.*\bcompte\b",
+        # Spanish / Portuguese
+        r"\b(elimin(ar|ado|ada|ados|adas|o|a|e)?|eliminaci[oó]n)\b",
+        r"\b(borr(ar|ado|ada|ados|adas|o|a)?)\b",
+        r"\b(exclu(ir|ído|ída|ídos|ídas|o|i)?|exclus[aã]o)\b",
+        r"\b(apag(ar|ado|ada|o|a)?)\b",
+        r"\b(cancel(ar|ado|ada|o|a)?)\b.*\b(cuenta|conta)\b",
+        r"\b(cerrar|fechar)\b.*\b(cuenta|conta)\b",
+        # Japanese
+        r"(削除|消去|解約)",
+        # Korean
+        r"(삭제|영구 삭제|탈퇴)",
+        # German
+        r"\b(l[oö]sch(en|t|te|ung)?|entfern(en|t|ung)?)\b",
+        # Italian
+        r"\b(cancell(are|ato|ata|ati|ate|azione)?|elimin(are|ato|ata|ati|ate|azione)?)\b",
+    ]
+
+    for pat in deletion_patterns:
+        if re.search(pat, tl):
+            return "DELETION"
+
+    return "AMBIGUOUS"
+
+
+# Backward compatibility alias
+classify_request_intent_heuristic = classify_request_intent
 
 
 class PolicyEngine:

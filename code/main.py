@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
 import os
 import re
 import sys
@@ -24,6 +25,8 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
+logger = logging.getLogger(__name__)
+
 from code.evidence_reader import (
     DEFAULT_PROHIBITED_PII_FIELDS,
     EvidenceManifest,
@@ -32,10 +35,23 @@ from code.evidence_reader import (
     SqlEvidenceReader,
     extract_exposed_pii_fields,
     is_timestamp_le,
+    is_valid_iso_timestamp,
 )
 from code.identity import IdentityResolver, UserIdentity, normalize_phone
 from code.policy import PolicyEngine, UnknownMappingError, classify_request_intent_heuristic
 from code.resource_linker import ResourceLinker
+
+
+def get_observation_timestamp(obs: ObservedResource) -> str:
+    """Extract effective observation timestamp from an ObservedResource."""
+    if obs.observed_at and is_valid_iso_timestamp(obs.observed_at):
+        return obs.observed_at.strip()
+    det = obs.details if isinstance(obs.details, dict) else {}
+    for k in ("captured_at", "recorded_at", "event_time", "timestamp", "exported_at", "snapshot_time"):
+        val = det.get(k)
+        if val and isinstance(val, str) and is_valid_iso_timestamp(val):
+            return val.strip()
+    return ""
 
 
 class DeletionAuditPipeline:
@@ -49,6 +65,34 @@ class DeletionAuditPipeline:
         self.sql_reader = SqlEvidenceReader(dataset_dir)
         self.linker = ResourceLinker(dataset_dir)
         self.engine = PolicyEngine(dataset_dir)
+        self.diagnostics: list[dict[str, Any]] = []
+
+    def record_diagnostic(
+        self,
+        case_id: str,
+        system_id: str,
+        resource_id: str,
+        error_type: str,
+        message: str,
+    ) -> None:
+        """Record diagnostic information for policy evaluation failures without exposing sensitive data."""
+        self.diagnostics.append({
+            "case_id": case_id,
+            "system_id": system_id,
+            "resource_id": resource_id,
+            "error_type": error_type,
+            "message": message,
+        })
+
+    def get_diagnostics(self, case_id: Optional[str] = None) -> list[dict[str, Any]]:
+        """Retrieve recorded diagnostics, optionally filtered by case_id."""
+        if case_id:
+            return [d for d in self.diagnostics if d["case_id"] == case_id]
+        return list(self.diagnostics)
+
+    def clear_diagnostics(self) -> None:
+        """Clear recorded diagnostics."""
+        self.diagnostics.clear()
 
     def extract_text_handover_resources(
         self,
@@ -90,9 +134,10 @@ class DeletionAuditPipeline:
                             system_id=sys_id,
                             resource_id=res_id,
                             observed_state=obs_state,
-                            details={"collection": cat, "candidate_category": cat, "raw_state": state_str},
+                            details={"collection": cat, "candidate_category": cat, "raw_state": state_str, "captured_at": ts},
                             subject_user_id=identity.user_id,
                             subject_email=ident_str,
+                            observed_at=ts,
                         ))
         return observed
 
@@ -135,6 +180,7 @@ class DeletionAuditPipeline:
             ts_match = re.match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)", tlines[0])
             if ts_match and not is_timestamp_le(ts_match.group(1), audit_at):
                 continue
+            trace_ts = ts_match.group(1) if ts_match else ""
 
             # Extract resource_id, service, and lookup keys using [:=] to support key=value and JSON "key":"value"
             res_match = re.search(r'\bresource_id["\']?\s*[:=]\s*["\']?([a-zA-Z0-9_-]+)["\']?', full_trace_str)
@@ -226,7 +272,7 @@ class DeletionAuditPipeline:
                     )
                     obs_state = "PRESENT" if has_pii else "ANONYMIZED"
 
-            det = {"trace_lines": tlines, "raw_service": raw_svc}
+            det = {"trace_lines": tlines, "raw_service": raw_svc, "captured_at": trace_ts}
             if candidate_cat:
                 det["candidate_category"] = candidate_cat
 
@@ -237,6 +283,7 @@ class DeletionAuditPipeline:
                 observed_state=obs_state,
                 details=det,
                 subject_user_id=identity.user_id,
+                observed_at=trace_ts,
             ))
 
         # Process standalone lines (like syslog or search diagnostics)
@@ -254,6 +301,7 @@ class DeletionAuditPipeline:
             ts_match = re.match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)", line_str)
             if ts_match and not is_timestamp_le(ts_match.group(1), audit_at):
                 continue
+            line_ts = ts_match.group(1) if ts_match else ""
 
             res_match = re.search(r'\bresource_id=["\']?([a-zA-Z0-9_-]+)["\']?', line_str)
             sys_m = re.search(r'\bsystem=["\']?([a-zA-Z0-9_-]+)["\']?', line_str)
@@ -275,8 +323,9 @@ class DeletionAuditPipeline:
                     system_id=sys_id,
                     resource_id=res_id,
                     observed_state=obs_state,
-                    details={"log_line": line_str},
+                    details={"log_line": line_str, "captured_at": line_ts},
                     subject_user_id=identity.user_id,
+                    observed_at=line_ts,
                 ))
 
         return observed
@@ -312,6 +361,9 @@ class DeletionAuditPipeline:
         if not matches_user:
             return []
 
+        fmeta = self.manifest.get_file_meta(evidence_id)
+        pdf_cap = fmeta.captured_at if fmeta else ""
+
         observed: list[ObservedResource] = []
         # Support attachment pattern
         sup_match = re.search(r'\b(support_\d+)\b', full_text)
@@ -324,8 +376,9 @@ class DeletionAuditPipeline:
                 system_id="support_platform",
                 resource_id=sup_match.group(1),
                 observed_state="PRESENT",
-                details={"collection": col_name, "candidate_category": cat_name, "source": "pdf_document"},
+                details={"collection": col_name, "candidate_category": cat_name, "source": "pdf_document", "captured_at": pdf_cap},
                 subject_user_id=identity.user_id,
+                observed_at=pdf_cap,
             ))
 
         # Legal hold pattern
@@ -336,8 +389,9 @@ class DeletionAuditPipeline:
                 system_id="legal_service",
                 resource_id=legal_match.group(1),
                 observed_state="PRESENT",
-                details={"collection": "retained_order_records", "source": "pdf_document"},
+                details={"collection": "retained_order_records", "source": "pdf_document", "captured_at": pdf_cap},
                 subject_user_id=identity.user_id,
+                observed_at=pdf_cap,
             ))
 
         return observed
@@ -366,19 +420,33 @@ class DeletionAuditPipeline:
                 items = self.json_reader.read_file(rel, fid, audit_at)
                 # Filter items belonging to this identity
                 for item in items:
+                    if not item.observed_at:
+                        item.observed_at = item.details.get("captured_at") or item.details.get("recorded_at") or fmeta.captured_at
                     if self._resource_matches_identity(item, identity):
                         observed_all.append(item)
             elif rel.endswith(".sql"):
                 items = self.sql_reader.inspect_sql_file(rel, fid, identity, audit_at)
+                for item in items:
+                    if not item.observed_at:
+                        item.observed_at = fmeta.captured_at
                 observed_all.extend(items)
             elif rel.endswith(".log"):
                 items = self.extract_log_resources(rel, fid, identity, audit_at)
+                for item in items:
+                    if not item.observed_at:
+                        item.observed_at = fmeta.captured_at
                 observed_all.extend(items)
             elif rel.endswith(".txt"):
                 items = self.extract_text_handover_resources(rel, fid, identity, audit_at)
+                for item in items:
+                    if not item.observed_at:
+                        item.observed_at = fmeta.captured_at
                 observed_all.extend(items)
             elif rel.endswith(".pdf"):
                 items = self.extract_pdf_resources(rel, fid, identity, audit_at)
+                for item in items:
+                    if not item.observed_at:
+                        item.observed_at = fmeta.captured_at
                 observed_all.extend(items)
 
         return observed_all
@@ -417,6 +485,75 @@ class DeletionAuditPipeline:
         return False
 
 
+    def select_historical_resources(
+        self,
+        observed_resources: list[ObservedResource],
+        audit_at: str,
+    ) -> dict[tuple[str, str], ObservedResource]:
+        """Select the relevant historical observation for each (system_id, resource_id) at audit_at.
+
+        Adheres strictly to the following requirements:
+        1. Grounded identification: Keyed by (system_id, resource_id) so distinct systems remain distinct.
+        2. Cutoff enforcement: Observations recorded after audit_at are strictly discarded.
+        3. Valid timestamp precedence: Observations with valid timestamps <= audit_at take precedence over
+           observations with missing or invalid timestamps.
+        4. Chronological progression: Newer valid observations supersede older ones (e.g. newer ABSENT over older PRESENT).
+        5. Conflict resolution at the same latest timestamp:
+           - Per AGENTS.md §6.1 / §6.5, if any copy/replica remains at that time, data exists (PRESENT / ACTIVE / IDENTIFIABLE).
+           - Deterministic tie-breaking on evidence_id and details.
+        """
+        grouped: dict[tuple[str, str], list[ObservedResource]] = {}
+
+        for obs in observed_resources:
+            sys_id = (obs.system_id or "").strip()
+            res_id = (obs.resource_id or "").strip()
+            if not sys_id or not res_id:
+                continue
+
+            obs_ts = get_observation_timestamp(obs)
+            if obs_ts and not is_timestamp_le(obs_ts, audit_at):
+                # Strictly after audit cutoff -> discard
+                continue
+
+            key = (sys_id, res_id)
+            if key not in grouped:
+                grouped[key] = []
+            grouped[key].append(obs)
+
+        selected: dict[tuple[str, str], ObservedResource] = {}
+
+        for key, obs_list in sorted(grouped.items()):
+            if len(obs_list) == 1:
+                selected[key] = obs_list[0]
+                continue
+
+            # Partition into timestamped (valid <= audit_at) and untimestamped
+            timestamped = [o for o in obs_list if get_observation_timestamp(o)]
+            untimestamped = [o for o in obs_list if not get_observation_timestamp(o)]
+
+            if timestamped:
+                latest_ts = max(get_observation_timestamp(o) for o in timestamped)
+                latest_candidates = [o for o in timestamped if get_observation_timestamp(o) == latest_ts]
+            else:
+                latest_candidates = untimestamped
+
+            if len(latest_candidates) == 1:
+                selected[key] = latest_candidates[0]
+                continue
+
+            # Multiple/conflicting observations at the latest timestamp:
+            # Check for remaining copies (PRESENT / ACTIVE / IDENTIFIABLE)
+            violation_states = ("PRESENT", "ACTIVE", "IDENTIFIABLE")
+            violations = [o for o in latest_candidates if o.observed_state in violation_states]
+            if violations:
+                violations.sort(key=lambda o: (bool(o.evidence_id), str(o.evidence_id), str(o.details)), reverse=True)
+                selected[key] = violations[0]
+            else:
+                latest_candidates.sort(key=lambda o: (bool(o.evidence_id), str(o.evidence_id), str(o.details)), reverse=True)
+                selected[key] = latest_candidates[0]
+
+        return selected
+
     def evaluate_case(self, request_row: dict[str, str]) -> tuple[str, str, list[dict[str, Any]]]:
         """Evaluate a single deletion request and return (case_id, deletion_status, steps)."""
         case_id = request_row["case_id"].strip()
@@ -428,12 +565,23 @@ class DeletionAuditPipeline:
         intent = classify_request_intent_heuristic(req_text)
         if intent == "NOT_APPLICABLE":
             return case_id, "NOT_APPLICABLE", []
+        if intent in ("AMBIGUOUS", "UNKNOWN"):
+            msg = f"Ambiguous or unknown request intent for case '{case_id}': cannot safely classify as authorized deletion."
+            logger.warning(msg)
+            self.record_diagnostic(case_id, "policy_service", "request_intent", "AmbiguousIntentError", msg)
+            return case_id, "INCOMPLETE", []
 
         # 2. Identity resolution and resource linking
         identity = self.resolver.resolve(email)
         if not identity:
-            # If identity cannot be resolved, request is not actionable under policy
-            return case_id, "NOT_APPLICABLE", []
+            # Authorized deletion request where identity could not be resolved:
+            # Must NOT be classified as NOT_APPLICABLE (since request is authorized).
+            # Must NOT be classified as COMPLETE (since identity/resource absence cannot be established).
+            # Must NOT fabricate resources or evidence.
+            msg = f"Identity resolution failed for authorized request in case '{case_id}'"
+            logger.warning(msg)
+            self.record_diagnostic(case_id, "identity_service", "unresolved_identity", "IdentityResolutionError", msg)
+            return case_id, "INCOMPLETE", []
 
         self.linker.populate_user_resources(identity, audit_at)
 
@@ -441,30 +589,34 @@ class DeletionAuditPipeline:
         requested_at = request_row.get("requested_at", "").strip()
         observed_resources = self.collect_case_evidence(identity, audit_at, requested_at)
 
-        # 4. Dedup observed resources by resource_id (keeping the most specific/latest)
-        latest_obs_by_res: dict[str, ObservedResource] = {}
-        for obs in observed_resources:
-            rid = obs.resource_id
-            if rid not in latest_obs_by_res:
-                latest_obs_by_res[rid] = obs
-            else:
-                # If existing is ABSENT but newer is PRESENT/ACTIVE/IDENTIFIABLE, prioritize violation
-                if obs.observed_state in ("PRESENT", "ACTIVE", "IDENTIFIABLE"):
-                    latest_obs_by_res[rid] = obs
+        # 4. Deduplicate resources and select historical state for each (system_id, resource_id) at audit_at
+        selected_resources = self.select_historical_resources(observed_resources, audit_at)
 
         # 5. Evaluate policy rules on each observed resource
         raw_steps: list[dict[str, Any]] = []
         is_violation_found = False
+        evaluation_failed = False
 
-        for res_id, obs in sorted(latest_obs_by_res.items()):
+        for (sys_id, res_id), obs in sorted(selected_resources.items()):
             try:
                 res_eval = self.engine.evaluate_resource(obs, audit_at=audit_at)
             except UnknownMappingError as err:
-                import logging
-                logging.warning(f"Unknown mapping for {obs.system_id}: {err}")
+                logger.warning(
+                    "Unknown mapping for case '%s', resource '%s:%s': %s",
+                    case_id, sys_id, res_id, err,
+                )
+                self.record_diagnostic(case_id, sys_id, res_id, "UnknownMappingError", str(err))
                 is_violation_found = True
+                evaluation_failed = True
                 continue
-            except Exception:
+            except Exception as err:
+                logger.error(
+                    "Policy evaluation failure for case '%s', resource '%s:%s': %s: %s",
+                    case_id, sys_id, res_id, type(err).__name__, err,
+                )
+                self.record_diagnostic(case_id, sys_id, res_id, type(err).__name__, str(err))
+                is_violation_found = True
+                evaluation_failed = True
                 continue
 
             if res_eval.get("is_violation"):
@@ -481,7 +633,7 @@ class DeletionAuditPipeline:
 
         # Determine deletion status
         # A case is COMPLETE only if:
-        # 1. No violation was found
+        # 1. No violation was found and policy evaluation completed without failure
         # 2. Primary account absence is proven by evidence
         # 3. All applicable retention obligations (e.g. required security audit record within supplied
         #    retention period or active legal hold) are verified as satisfied by discovered evidence.
@@ -491,7 +643,7 @@ class DeletionAuditPipeline:
         acc_has_evidence = False
         if has_acc_step:
             acc_has_evidence = any(s["system_id"] == "account_service" and bool(s.get("evidence_id")) for s in raw_steps)
-        elif acc_info and acc_info[1]:
+        elif acc_info and acc_info[1] and not str(acc_info[1]).startswith("activity_") and (acc_info[0].startswith("account_") or acc_info[0].startswith("tombstone_")):
             acc_has_evidence = True
 
         # Check applicable retention obligations:
@@ -521,14 +673,14 @@ class DeletionAuditPipeline:
             if not svc_in_steps and not (svc_info and svc_info[1]):
                 retention_satisfied = False
 
-        is_complete = (not is_violation_found) and acc_has_evidence and retention_satisfied
+        is_complete = (not is_violation_found) and (not evaluation_failed) and acc_has_evidence and retention_satisfied
         case_status = "COMPLETE" if is_complete else "INCOMPLETE"
 
         # 1. Primary account verification in account_service
-        if not has_acc_step:
-            acc_id = acc_info[0] if acc_info else f"account_{uid.split('_')[1]}"
-            evid = acc_info[1] if acc_info else ""
-            if is_complete:
+        if not has_acc_step and acc_info and (acc_info[0].startswith("account_") or acc_info[0].startswith("tombstone_")):
+            acc_id, evid = acc_info
+            evid_clean = evid if not str(evid).startswith("activity_") else ""
+            if is_complete and evid_clean:
                 raw_steps.append({
                     "step_no": 999,
                     "phase": "VERIFICATION",
@@ -536,29 +688,9 @@ class DeletionAuditPipeline:
                     "resource_id": acc_id,
                     "operation": "VERIFY_RECORD_ABSENT",
                     "state": "ABSENT",
-                    "evidence_id": evid,
+                    "evidence_id": evid_clean,
                 })
-            else:
-                if not any(s["phase"] == "FINDING" for s in raw_steps) and not acc_has_evidence:
-                    finding_evid = evid or "activity_4000"
-                    raw_steps.append({
-                        "step_no": 999,
-                        "phase": "FINDING",
-                        "system_id": "account_service",
-                        "resource_id": acc_id,
-                        "operation": "REPORT_REMAINING_RECORD",
-                        "state": "PRESENT",
-                        "evidence_id": finding_evid,
-                    })
-                    raw_steps.append({
-                        "step_no": 999,
-                        "phase": "REMEDIATION",
-                        "system_id": "account_service",
-                        "resource_id": acc_id,
-                        "operation": "DELETE_RECORD",
-                        "state": "ABSENT",
-                        "evidence_id": "",
-                    })
+            elif not is_complete:
                 raw_steps.append({
                     "step_no": 999,
                     "phase": "VERIFICATION",
@@ -575,7 +707,8 @@ class DeletionAuditPipeline:
             aud_info = self.linker.get_user_resource(uid, "security_service", audit_at)
             if aud_info:
                 aud_id, evid = aud_info
-                if not is_complete or evid:
+                aud_cap = self.linker.get_resource_captured_at(uid, "security_service", aud_id, audit_at)
+                if (is_complete and evid) or (not is_complete and is_timestamp_le(requested_at, aud_cap)):
                     raw_steps.append({
                         "step_no": 999,
                         "phase": "VERIFICATION",
@@ -603,11 +736,26 @@ class DeletionAuditPipeline:
                         "evidence_id": evid,
                     })
 
+        # Step deduplication: ensure duplicate observations or rules do not create duplicate audit steps
+        deduped_raw_steps: list[dict[str, Any]] = []
+        seen_step_signatures: set[tuple[str, str, str, str]] = set()
+
+        for s in raw_steps:
+            sig = (s["phase"], s["system_id"], s["resource_id"], s["operation"])
+            if sig not in seen_step_signatures:
+                seen_step_signatures.add(sig)
+                deduped_raw_steps.append(s)
+            else:
+                for existing in deduped_raw_steps:
+                    if (existing["phase"], existing["system_id"], existing["resource_id"], existing["operation"]) == sig:
+                        if not existing.get("evidence_id") and s.get("evidence_id"):
+                            existing["evidence_id"] = s["evidence_id"]
+
         # Ensure strict evidence_id conformance:
         # In INCOMPLETE cases, post-remediation verification must have evidence_id = ""
         # In COMPLETE cases, verification steps must have non-empty evidence_id
         filtered_steps = []
-        for s in raw_steps:
+        for s in deduped_raw_steps:
             if not is_complete and s["phase"] in ("REMEDIATION", "VERIFICATION"):
                 s["evidence_id"] = ""
                 filtered_steps.append(s)
